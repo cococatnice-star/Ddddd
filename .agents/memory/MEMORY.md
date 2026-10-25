@@ -1,0 +1,1 @@
+- [CocoX.wtf vouches](cocox-vouches.md) — Public vouch cards must be author-submitted and attributed, never fabricated or timer-posted.
