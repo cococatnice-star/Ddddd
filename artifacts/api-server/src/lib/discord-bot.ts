@@ -1,9 +1,15 @@
 import {
   AttachmentBuilder,
   Client,
+  ChannelType,
   EmbedBuilder,
   Events,
   GatewayIntentBits,
+  ApplicationCommandOptionType,
+  PermissionFlagsBits,
+  SlashCommandBuilder,
+  type Guild,
+  type ChatInputCommandInteraction,
   type Message,
 } from "discord.js";
 import { logger } from "./logger";
@@ -21,6 +27,61 @@ const DELTA_RESPONSE = "It's working and updated.";
 const SYSTEM_PROMPT =
   "You are CocoX.wtf's friendly Discord helper. Answer the user's question clearly and conversationally. Do not claim you checked live systems, accounts, or external services. If asked about Delta, the bot handles that separately. Do not make up endorsements, user identities, or facts about CocoX.wtf.";
 
+const SERVER_SETUP_COMMAND = new SlashCommandBuilder()
+  .setName("setup")
+  .setDescription("Set up CocoX.wtf server channels")
+  .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
+  .addSubcommand((subcommand) =>
+    subcommand
+      .setName("server")
+      .setDescription("Create the channels shown in the CocoX.wtf server layout"),
+  )
+  .toJSON();
+
+const SERVER_SETUP_CHANNELS = [
+  {
+    name: "Text Channels",
+    type: ChannelType.GuildCategory,
+    channels: [
+      "💬general-chat",
+      "🎁giveaway",
+      "🔢counting",
+      "✅vouches",
+      "😎facereaveal",
+      "📣announcements",
+      "😔hall-of-shame",
+      "traitfarms🔥",
+    ],
+  },
+  {
+    name: "Voice Channels",
+    type: ChannelType.GuildCategory,
+    channels: ["General", "Method vc", "goon vc", "Trade vc", "Admin abuse"],
+  },
+  {
+    name: "Indexing",
+    type: ChannelType.GuildCategory,
+    channels: ["💿brainrots-index", "💎og-index’s"],
+  },
+  {
+    name: "Trading",
+    type: ChannelType.GuildCategory,
+    channels: ["🤍small-trades", "💙mid-trades", "🧡og-trades", "🩵big-trades"],
+  },
+  {
+    name: "Pub method",
+    type: ChannelType.GuildCategory,
+    channels: ["🔥pubmethod-steals", "😡pubmethod-sellouts"],
+  },
+  {
+    name: "Key bypass🔑",
+    type: ChannelType.GuildCategory,
+    channels: ["🔑bypass"],
+  },
+] as const;
+
+const SERVER_SETUP_ROOT_CHANNELS = ["📃rules"] as const;
+
 type Conversation = {
   messages: OpenRouterChatMessage[];
   lastActivityAt: number;
@@ -29,6 +90,198 @@ type Conversation = {
 const conversations = new Map<string, Conversation>();
 const lastAiReplyAt = new Map<string, number>();
 const lastVouchAt = new Map<string, number>();
+
+async function registerSetupCommand(guild: Guild): Promise<void> {
+  const commands = await guild.commands.fetch();
+  const existingCommand = commands.find(
+    (command) => command.name === SERVER_SETUP_COMMAND.name,
+  );
+
+  if (existingCommand) {
+    await existingCommand.edit({
+      name: "setup",
+      description: "Set up CocoX.wtf server channels",
+      defaultMemberPermissions: PermissionFlagsBits.Administrator,
+      options: [
+        {
+          type: ApplicationCommandOptionType.Subcommand,
+          name: "server",
+          description: "Create the channels shown in the CocoX.wtf server layout",
+        },
+      ],
+    });
+    return;
+  }
+
+  await guild.commands.create(SERVER_SETUP_COMMAND);
+}
+
+async function ensureSetupChannel(
+  guild: Guild,
+  name: string,
+  type:
+    | ChannelType.GuildText
+    | ChannelType.GuildVoice
+    | ChannelType.GuildCategory,
+  parentId?: string,
+): Promise<"created" | "exists" | "elsewhere"> {
+  const matchingChannels = guild.channels.cache.filter(
+    (channel) => channel.name === name,
+  );
+  const inExpectedLocation = matchingChannels.find(
+    (channel) =>
+      channel.type === type &&
+      (parentId ? channel.parentId === parentId : channel.parentId === null),
+  );
+
+  if (inExpectedLocation) return "exists";
+  if (matchingChannels.size > 0) return "elsewhere";
+
+  await guild.channels.create({
+    name,
+    type,
+    ...(parentId ? { parent: parentId } : {}),
+  });
+  return "created";
+}
+
+async function handleServerSetup(
+  interaction: ChatInputCommandInteraction,
+): Promise<void> {
+  if (!interaction.guild) {
+    await interaction.reply({
+      content: "This command can only be used in a server.",
+      ephemeral: true,
+    });
+    return;
+  }
+
+  if (!interaction.memberPermissions?.has(PermissionFlagsBits.Administrator)) {
+    await interaction.reply({
+      content: "Only server administrators can run `/setup server`.",
+      ephemeral: true,
+    });
+    return;
+  }
+
+  if (!interaction.appPermissions.has(PermissionFlagsBits.ManageChannels)) {
+    await interaction.reply({
+      content: "I need the Manage Channels permission to set up the server.",
+      ephemeral: true,
+    });
+    return;
+  }
+
+  await interaction.reply({
+    content: "Setting up server…",
+    ephemeral: true,
+  });
+
+  const created: string[] = [];
+  const alreadyPresent: string[] = [];
+  const foundElsewhere: string[] = [];
+  const failed: string[] = [];
+  const guild = interaction.guild;
+
+  try {
+    await guild.channels.fetch();
+
+    for (const channelName of SERVER_SETUP_ROOT_CHANNELS) {
+      try {
+        const result = await ensureSetupChannel(
+          guild,
+          channelName,
+          ChannelType.GuildText,
+        );
+        if (result === "created") created.push(channelName);
+        else if (result === "exists") alreadyPresent.push(channelName);
+        else foundElsewhere.push(channelName);
+      } catch {
+        failed.push(channelName);
+      }
+    }
+
+    for (const category of SERVER_SETUP_CHANNELS) {
+      let categoryId: string | undefined;
+
+      try {
+        const categoryResult = await ensureSetupChannel(
+          guild,
+          category.name,
+          ChannelType.GuildCategory,
+        );
+        if (categoryResult === "created") created.push(category.name);
+        else if (categoryResult === "exists") alreadyPresent.push(category.name);
+        else {
+          foundElsewhere.push(category.name);
+          continue;
+        }
+
+        categoryId = guild.channels.cache.find(
+          (channel) =>
+            channel.name === category.name &&
+            channel.type === ChannelType.GuildCategory &&
+            channel.parentId === null,
+        )?.id;
+
+        if (!categoryId) {
+          failed.push(`${category.name} (category lookup)`);
+          continue;
+        }
+      } catch {
+        failed.push(category.name);
+        continue;
+      }
+
+      const channelType =
+        category.name === "Voice Channels"
+          ? ChannelType.GuildVoice
+          : ChannelType.GuildText;
+
+      for (const channelName of category.channels) {
+        try {
+          const result = await ensureSetupChannel(
+            guild,
+            channelName,
+            channelType,
+            categoryId,
+          );
+          const label = `${category.name} / ${channelName}`;
+          if (result === "created") created.push(label);
+          else if (result === "exists") alreadyPresent.push(label);
+          else foundElsewhere.push(label);
+        } catch {
+          failed.push(`${category.name} / ${channelName}`);
+        }
+      }
+    }
+
+    const summary = [
+      `Server setup finished. Created ${created.length} channel${created.length === 1 ? "" : "s"}.`,
+      alreadyPresent.length
+        ? `Already in place: ${alreadyPresent.length}.`
+        : "",
+      foundElsewhere.length
+        ? `Skipped because a matching name exists in a different location: ${foundElsewhere.join(", ")}.`
+        : "",
+      failed.length
+        ? `Could not create: ${failed.join(", ")}. Check that I have Manage Channels permission.`
+        : "",
+    ]
+      .filter(Boolean)
+      .join("\n");
+
+    await interaction.editReply(summary);
+  } catch (error) {
+    logger.warn(
+      { error: error instanceof Error ? error.message : "Unknown error" },
+      "Discord server setup failed",
+    );
+    await interaction.editReply(
+      `Server setup stopped. Created ${created.length} channel${created.length === 1 ? "" : "s"} before the error. Check the bot's Manage Channels permission and try again.`,
+    );
+  }
+}
 
 function conversationKey(message: Message): string {
   return `${message.guildId ?? "dm"}:${message.channelId}:${message.author.id}`;
@@ -303,6 +556,58 @@ export async function startDiscordBot(): Promise<void> {
       { username: readyClient.user.username },
       "Discord bot is connected",
     );
+    for (const guild of readyClient.guilds.cache.values()) {
+      void registerSetupCommand(guild).catch((error: unknown) => {
+        logger.warn(
+          {
+            guildId: guild.id,
+            error: error instanceof Error ? error.message : "Unknown error",
+          },
+          "Could not register server setup command",
+        );
+      });
+    }
+  });
+
+  client.on(Events.GuildCreate, (guild) => {
+    void registerSetupCommand(guild).catch((error: unknown) => {
+      logger.warn(
+        {
+          guildId: guild.id,
+          error: error instanceof Error ? error.message : "Unknown error",
+        },
+        "Could not register server setup command",
+      );
+    });
+  });
+
+  client.on(Events.InteractionCreate, (interaction) => {
+    if (
+      !interaction.isChatInputCommand() ||
+      interaction.commandName !== "setup" ||
+      interaction.options.getSubcommand() !== "server"
+    ) {
+      return;
+    }
+
+    void handleServerSetup(interaction).catch((error: unknown) => {
+      logger.warn(
+        {
+          error: error instanceof Error ? error.message : "Unknown error",
+          guildId: interaction.guildId,
+        },
+        "Discord server setup command failed",
+      );
+      const response = {
+        content: "The setup command failed. Check the bot's permissions and try again.",
+        ephemeral: true,
+      };
+      if (interaction.deferred || interaction.replied) {
+        void interaction.editReply(response.content);
+      } else {
+        void interaction.reply(response);
+      }
+    });
   });
 
   client.on(Events.MessageCreate, (message) => {
