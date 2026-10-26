@@ -21,7 +21,8 @@ const SESSION_TTL_MS = 15 * 60 * 1000;
 const SESSION_CLEANUP_INTERVAL_MS = 5 * 60 * 1000;
 const AI_COOLDOWN_MS = 4_000;
 const VOUCH_COOLDOWN_MS = 60_000;
-const CONTROLLER_MUTE_DURATION_MS = 19 * 60 * 1000;
+const DEFAULT_BOT_MUTE_DURATION_MS = 19 * 60 * 1000;
+const MAX_BOT_MUTE_DURATION_MS = 30 * 24 * 60 * 60 * 1000;
 const MAX_HISTORY_MESSAGES = 12;
 const MAX_DISCORD_MESSAGE_LENGTH = 1_900;
 const DELTA_RESPONSE = "It's working and updated.";
@@ -30,7 +31,7 @@ const BOT_MUTE_CONTROLLER_IDS = new Set([
   "1564108651843682327",
 ]);
 const MUTE_REQUEST_PATTERN =
-  /\b(?:stop|mute|quiet|silence|shut\s+up|don't\s+(?:talk|respond|reply)|do\s+not\s+(?:talk|respond|reply)|stay\s+quiet)\b|\b(?:talk|speak|reply)\s+in\s+19\s*(?:m|min|minutes?)\b/i;
+  /\b(?:stop|mute|quiet|silence|shut\s+up|don't\s+(?:talk|respond|reply)|do\s+not\s+(?:talk|respond|reply)|stay\s+quiet)\b|\b(?:talk|speak|reply)\s+(?:in|after)\b/i;
 const UNMUTE_REQUEST_PATTERN =
   /\b(?:unmute|resume|talk\s+again|start\s+talking)\b/i;
 const SYSTEM_PROMPT =
@@ -516,6 +517,82 @@ function stripUserMentions(content: string): string {
   return content.replace(/<@!?\d+>/g, " ").replace(/\s+/g, " ").trim();
 }
 
+function formatMuteDuration(durationMs: number): string {
+  const units = [
+    [7 * 24 * 60 * 60 * 1000, "week"],
+    [24 * 60 * 60 * 1000, "day"],
+    [60 * 60 * 1000, "hour"],
+    [60 * 1000, "minute"],
+  ] as const;
+
+  const [unitMs, unitName] =
+    units.find(([candidateMs]) => durationMs % candidateMs === 0) ??
+    units[units.length - 1];
+  const amount = Math.ceil(durationMs / unitMs);
+  return `${amount} ${unitName}${amount === 1 ? "" : "s"}`;
+}
+
+function parseMuteDuration(commandText: string): {
+  durationMs: number;
+  label: string;
+  capped: boolean;
+} {
+  const durationMatch = commandText.match(
+    /\b(a\s+few|a\s+couple|several|\d+|a|an|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve)\s*(minutes?|mins?|m|hours?|hrs?|h|days?|d|weeks?|w)\b/i,
+  );
+
+  if (!durationMatch) {
+    return {
+      durationMs: DEFAULT_BOT_MUTE_DURATION_MS,
+      label: formatMuteDuration(DEFAULT_BOT_MUTE_DURATION_MS),
+      capped: false,
+    };
+  }
+
+  const numberText = durationMatch[1]!.toLowerCase().replace(/\s+/g, " ");
+  const numberWords: Record<string, number> = {
+    "a few": 3,
+    "a couple": 2,
+    several: 3,
+    a: 1,
+    an: 1,
+    one: 1,
+    two: 2,
+    three: 3,
+    four: 4,
+    five: 5,
+    six: 6,
+    seven: 7,
+    eight: 8,
+    nine: 9,
+    ten: 10,
+    eleven: 11,
+    twelve: 12,
+  };
+  const amount = /^\d+$/.test(numberText)
+    ? Number(numberText)
+    : numberWords[numberText] ?? 1;
+  const unitText = durationMatch[2]!.toLowerCase();
+  const unitMs = /^(?:m|min|mins|minute|minutes)$/.test(unitText)
+    ? 60 * 1000
+    : /^(?:h|hr|hrs|hour|hours)$/.test(unitText)
+      ? 60 * 60 * 1000
+      : /^(?:d|day|days)$/.test(unitText)
+        ? 24 * 60 * 60 * 1000
+        : 7 * 24 * 60 * 60 * 1000;
+  const requestedDurationMs = amount * unitMs;
+  const durationMs = Math.min(
+    requestedDurationMs,
+    MAX_BOT_MUTE_DURATION_MS,
+  );
+
+  return {
+    durationMs,
+    label: formatMuteDuration(durationMs),
+    capped: requestedDurationMs > MAX_BOT_MUTE_DURATION_MS,
+  };
+}
+
 async function handleMuteControlMessage(
   client: Client,
   message: Message,
@@ -549,7 +626,8 @@ async function handleMuteControlMessage(
 
   if (!MUTE_REQUEST_PATTERN.test(commandText)) return false;
 
-  const mutedUntil = Date.now() + CONTROLLER_MUTE_DURATION_MS;
+  const duration = parseMuteDuration(commandText);
+  const mutedUntil = Date.now() + duration.durationMs;
   mutedGuilds.set(message.guildId!, mutedUntil);
   const guildConversationPrefix = `${message.guildId}:`;
   for (const [key, conversation] of conversations) {
@@ -560,7 +638,7 @@ async function handleMuteControlMessage(
 
   await replyWithoutMentions(
     message,
-    "I'll stop replying to everyone in this server, across all channels, for up to 19 minutes. An approved account can ping me and say `unmute` to resume sooner.",
+    `I'll stop replying to everyone in this server, across all channels, for ${duration.label}${duration.capped ? " (the 30-day maximum)" : ""}. An approved account can ping me and say \`unmute\` to resume sooner.`,
   );
   return true;
 }
