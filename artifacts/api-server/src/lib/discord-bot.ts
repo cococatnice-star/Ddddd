@@ -38,6 +38,53 @@ const SERVER_SETUP_COMMAND = new SlashCommandBuilder()
   )
   .toJSON();
 
+const CREATE_ROLES_COMMAND = new SlashCommandBuilder()
+  .setName("create")
+  .setDescription("Create CocoX.wtf server roles")
+  .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
+  .addSubcommand((subcommand) =>
+    subcommand
+      .setName("roles")
+      .setDescription("Create community roles and moderator permissions"),
+  )
+  .toJSON();
+
+const MODERATOR_ROLE_PERMISSIONS =
+  PermissionFlagsBits.ModerateMembers |
+  PermissionFlagsBits.MuteMembers |
+  PermissionFlagsBits.DeafenMembers |
+  PermissionFlagsBits.ManageMessages |
+  PermissionFlagsBits.KickMembers;
+
+type RolePreset = {
+  name: string;
+  color: number;
+  permissions?: bigint;
+};
+
+const SERVER_ROLE_PRESETS: readonly RolePreset[] = [
+  { name: "New Member", color: 0x95a5a6 },
+  { name: "Member", color: 0x7289da },
+  { name: "Verified", color: 0x43b581 },
+  { name: "Trader", color: 0xe67e22 },
+  { name: "Buyer", color: 0x2ecc71 },
+  { name: "Seller", color: 0xe74c3c },
+  { name: "Trusted Trader", color: 0x1abc9c },
+  { name: "VIP", color: 0xf1c40f },
+  { name: "Booster", color: 0xf47fff },
+  { name: "Giveaway Winner", color: 0xff9966 },
+  { name: "Creator", color: 0x3498db },
+  { name: "Media", color: 0x9b59b6 },
+  { name: "Support", color: 0x5865f2 },
+  { name: "Helper", color: 0x57f287 },
+  {
+    name: "Moderator",
+    color: 0xed4245,
+    permissions: MODERATOR_ROLE_PERMISSIONS,
+  },
+  { name: "Bot", color: 0x99aab5 },
+];
+
 const SERVER_SETUP_CHANNELS = [
   {
     name: "Text Channels",
@@ -90,15 +137,27 @@ type Conversation = {
 const conversations = new Map<string, Conversation>();
 const lastAiReplyAt = new Map<string, number>();
 const lastVouchAt = new Map<string, number>();
+const guildCommandRegistrations = new Map<string, Promise<void>>();
 
-async function registerSetupCommand(guild: Guild): Promise<void> {
+async function registerGuildCommands(guild: Guild): Promise<void> {
+  const existingRegistration = guildCommandRegistrations.get(guild.id);
+  if (existingRegistration) return existingRegistration;
+
+  const registration = syncGuildCommands(guild).finally(() => {
+    guildCommandRegistrations.delete(guild.id);
+  });
+  guildCommandRegistrations.set(guild.id, registration);
+  return registration;
+}
+
+async function syncGuildCommands(guild: Guild): Promise<void> {
   const commands = await guild.commands.fetch();
-  const existingCommand = commands.find(
+  const existingSetupCommand = commands.find(
     (command) => command.name === SERVER_SETUP_COMMAND.name,
   );
 
-  if (existingCommand) {
-    await existingCommand.edit({
+  if (existingSetupCommand) {
+    await existingSetupCommand.edit({
       name: "setup",
       description: "Set up CocoX.wtf server channels",
       defaultMemberPermissions: PermissionFlagsBits.Administrator,
@@ -110,10 +169,121 @@ async function registerSetupCommand(guild: Guild): Promise<void> {
         },
       ],
     });
+  } else {
+    await guild.commands.create(SERVER_SETUP_COMMAND);
+  }
+
+  const existingCreateCommand = commands.find(
+    (command) => command.name === CREATE_ROLES_COMMAND.name,
+  );
+
+  if (existingCreateCommand) {
+    await existingCreateCommand.edit({
+      name: "create",
+      description: "Create CocoX.wtf server roles",
+      defaultMemberPermissions: PermissionFlagsBits.Administrator,
+      options: [
+        {
+          type: ApplicationCommandOptionType.Subcommand,
+          name: "roles",
+          description: "Create community roles and moderator permissions",
+        },
+      ],
+    });
+  } else {
+    await guild.commands.create(CREATE_ROLES_COMMAND);
+  }
+}
+
+async function handleCreateRoles(
+  interaction: ChatInputCommandInteraction,
+): Promise<void> {
+  if (!interaction.guild) {
+    await interaction.reply({
+      content: "This command can only be used in a server.",
+      ephemeral: true,
+    });
     return;
   }
 
-  await guild.commands.create(SERVER_SETUP_COMMAND);
+  if (!interaction.memberPermissions?.has(PermissionFlagsBits.Administrator)) {
+    await interaction.reply({
+      content: "Only server administrators can run `/create roles`.",
+      ephemeral: true,
+    });
+    return;
+  }
+
+  if (!interaction.appPermissions.has(PermissionFlagsBits.ManageRoles)) {
+    await interaction.reply({
+      content: "I need the Manage Roles permission to create and configure roles.",
+      ephemeral: true,
+    });
+    return;
+  }
+
+  await interaction.reply({
+    content: "Creating CocoX.wtf roles…",
+    ephemeral: true,
+  });
+
+  const guild = interaction.guild;
+  const created: string[] = [];
+  const alreadyPresent: string[] = [];
+  const failed: string[] = [];
+
+  try {
+    await guild.roles.fetch();
+
+    for (const preset of SERVER_ROLE_PRESETS) {
+      const existingRole = guild.roles.cache.find(
+        (role) =>
+          role.name.trim().toLocaleLowerCase() ===
+          preset.name.trim().toLocaleLowerCase(),
+      );
+
+      try {
+        if (existingRole) {
+          alreadyPresent.push(`${preset.name} (matched ${existingRole.name})`);
+          continue;
+        }
+
+        await guild.roles.create({
+          name: preset.name,
+          color: preset.color,
+          permissions: preset.permissions ?? 0n,
+          mentionable: false,
+          reason: "CocoX.wtf /create roles",
+        });
+        created.push(preset.name);
+      } catch {
+        failed.push(preset.name);
+      }
+    }
+
+    const summary = [
+      `Role setup finished. Created ${created.length} role${created.length === 1 ? "" : "s"}.`,
+      alreadyPresent.length
+        ? `Skipped because they already exist; left unchanged: ${alreadyPresent.join(", ")}.`
+        : "",
+      failed.length
+        ? `Could not create: ${failed.join(", ")}. Check the bot's role hierarchy and Manage Roles permission.`
+        : "",
+      "Roles are not assigned to members automatically. A newly created Moderator gets timeout, voice mute/deafen, message management, and kick permissions; existing roles are never changed.",
+    ]
+      .filter(Boolean)
+      .join("\n");
+
+    await interaction.editReply(summary);
+  } catch (error) {
+    logger.warn(
+      { error: error instanceof Error ? error.message : "Unknown error" },
+      "Discord role setup failed",
+    );
+    await interaction.editReply(
+      `Role setup stopped. Created ${created.length} role${created.length === 1 ? "" : "s"} before the error. Check the bot's Manage Roles permission and try again.`,
+    );
+  }
 }
 
 async function ensureSetupChannel(
@@ -557,49 +727,57 @@ export async function startDiscordBot(): Promise<void> {
       "Discord bot is connected",
     );
     for (const guild of readyClient.guilds.cache.values()) {
-      void registerSetupCommand(guild).catch((error: unknown) => {
+      void registerGuildCommands(guild).catch((error: unknown) => {
         logger.warn(
           {
             guildId: guild.id,
             error: error instanceof Error ? error.message : "Unknown error",
           },
-          "Could not register server setup command",
+          "Could not register CocoX.wtf slash commands",
         );
       });
     }
   });
 
   client.on(Events.GuildCreate, (guild) => {
-    void registerSetupCommand(guild).catch((error: unknown) => {
+    void registerGuildCommands(guild).catch((error: unknown) => {
       logger.warn(
         {
           guildId: guild.id,
           error: error instanceof Error ? error.message : "Unknown error",
         },
-        "Could not register server setup command",
+        "Could not register CocoX.wtf slash commands",
       );
     });
   });
 
   client.on(Events.InteractionCreate, (interaction) => {
-    if (
-      !interaction.isChatInputCommand() ||
-      interaction.commandName !== "setup" ||
-      interaction.options.getSubcommand() !== "server"
-    ) {
-      return;
-    }
+    if (!interaction.isChatInputCommand()) return;
 
-    void handleServerSetup(interaction).catch((error: unknown) => {
+    let handler: (() => Promise<void>) | undefined;
+    if (
+      interaction.commandName === "setup" &&
+      interaction.options.getSubcommand() === "server"
+    ) {
+      handler = () => handleServerSetup(interaction);
+    } else if (
+      interaction.commandName === "create" &&
+      interaction.options.getSubcommand() === "roles"
+    ) {
+      handler = () => handleCreateRoles(interaction);
+    }
+    if (!handler) return;
+
+    void handler().catch((error: unknown) => {
       logger.warn(
         {
           error: error instanceof Error ? error.message : "Unknown error",
           guildId: interaction.guildId,
         },
-        "Discord server setup command failed",
+        "Discord slash command failed",
       );
       const response = {
-        content: "The setup command failed. Check the bot's permissions and try again.",
+        content: `The /${interaction.commandName} command failed. Check the bot's permissions and try again.`,
         ephemeral: true,
       };
       if (interaction.deferred || interaction.replied) {

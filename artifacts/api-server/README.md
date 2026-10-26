@@ -9,13 +9,14 @@ This bot starts when the API Server workflow starts. It does not post on a timer
 - A message containing the word “Delta” gets the fixed response: “It's working and updated.”
 - A person can submit their own public feedback with `!vouch <your own feedback>`. The bot creates a CocoX.wtf-branded image showing the submitter’s Discord username and posts it to the configured vouch channel. It does not invent names or endorsements.
 - Server administrators can run `/setup server` to create the channel groups and channels shown in the CocoX.wtf layout. The command skips channels already in the right place and does not change existing channel permissions.
+- Server administrators can run `/create roles` to create community roles. The `Moderator` role gets timeout, voice mute/deafen, message management, and kick permissions when newly created; existing role names are skipped and left unchanged. Other new roles have no extra permissions, and roles are not automatically assigned to members.
 - Conversations expire after 15 minutes without a message. `!stop` ends one early.
 
 ## Connect the bot
 
 1. Create a Discord application and bot in the Discord Developer Portal.
 2. In the bot settings, enable **Message Content Intent** so the bot can read follow-up questions and `!vouch` submissions.
-3. Invite the bot to your server with the `applications.commands` scope and permissions to view channels, send messages, read message history, attach files, and manage channels.
+3. Invite the bot to your server with the `applications.commands` scope and permissions to view channels, send messages, read message history, attach files, manage channels, and manage roles.
 4. Add these values using the project’s secure settings:
    - `DISCORD_BOT_TOKEN` — secret bot token from the Developer Portal.
    - `OPENROUTER_API_KEY` — secret key for your OpenRouter account. Free model availability and rate limits are controlled by OpenRouter.
