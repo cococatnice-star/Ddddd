@@ -21,9 +21,18 @@ const SESSION_TTL_MS = 15 * 60 * 1000;
 const SESSION_CLEANUP_INTERVAL_MS = 5 * 60 * 1000;
 const AI_COOLDOWN_MS = 4_000;
 const VOUCH_COOLDOWN_MS = 60_000;
+const CONTROLLER_MUTE_DURATION_MS = 19 * 60 * 1000;
 const MAX_HISTORY_MESSAGES = 12;
 const MAX_DISCORD_MESSAGE_LENGTH = 1_900;
 const DELTA_RESPONSE = "It's working and updated.";
+const BOT_MUTE_CONTROLLER_IDS = new Set([
+  "1153432454980448381",
+  "1564108651843682327",
+]);
+const MUTE_REQUEST_PATTERN =
+  /\b(?:stop|mute|quiet|silence|shut\s+up|don't\s+(?:talk|respond|reply)|do\s+not\s+(?:talk|respond|reply)|stay\s+quiet)\b|\b(?:talk|speak|reply)\s+in\s+19\s*(?:m|min|minutes?)\b/i;
+const UNMUTE_REQUEST_PATTERN =
+  /\b(?:unmute|resume|talk\s+again|start\s+talking)\b/i;
 const SYSTEM_PROMPT =
   "You are CocoX.wtf's friendly Discord helper. Answer the user's question clearly and conversationally. Do not claim you checked live systems, accounts, or external services. If asked about Delta, the bot handles that separately. Do not make up endorsements, user identities, or facts about CocoX.wtf.";
 
@@ -137,6 +146,7 @@ type Conversation = {
 const conversations = new Map<string, Conversation>();
 const lastAiReplyAt = new Map<string, number>();
 const lastVouchAt = new Map<string, number>();
+const mutedConversations = new Map<string, number>();
 const guildCommandRegistrations = new Map<string, Promise<void>>();
 
 async function registerGuildCommands(guild: Guild): Promise<void> {
@@ -453,8 +463,20 @@ async function handleServerSetup(
   }
 }
 
+function conversationKeyFor(
+  guildId: string,
+  channelId: string,
+  userId: string,
+): string {
+  return `${guildId}:${channelId}:${userId}`;
+}
+
 function conversationKey(message: Message): string {
-  return `${message.guildId ?? "dm"}:${message.channelId}:${message.author.id}`;
+  return conversationKeyFor(
+    message.guildId ?? "dm",
+    message.channelId,
+    message.author.id,
+  );
 }
 
 function trimDiscordMessage(value: string): string {
@@ -477,6 +499,10 @@ function pruneExpiredState(now = Date.now()): void {
   for (const [key, timestamp] of lastVouchAt) {
     if (now - timestamp > VOUCH_COOLDOWN_MS * 2) lastVouchAt.delete(key);
   }
+
+  for (const [key, mutedUntil] of mutedConversations) {
+    if (now >= mutedUntil) mutedConversations.delete(key);
+  }
 }
 
 async function replyWithoutMentions(message: Message, content: string): Promise<void> {
@@ -484,6 +510,107 @@ async function replyWithoutMentions(message: Message, content: string): Promise<
     content: trimDiscordMessage(content),
     allowedMentions: { parse: [], repliedUser: false },
   });
+}
+
+function stripUserMentions(content: string): string {
+  return content.replace(/<@!?\d+>/g, " ").replace(/\s+/g, " ").trim();
+}
+
+async function handleMuteControlMessage(
+  client: Client,
+  message: Message,
+): Promise<boolean> {
+  const botId = client.user?.id;
+  if (!botId || !message.mentions.users.has(botId)) return false;
+
+  const commandText = stripUserMentions(message.content);
+  const isController = BOT_MUTE_CONTROLLER_IDS.has(message.author.id);
+  const targets = [...message.mentions.users.values()].filter(
+    (user) => user.id !== botId,
+  );
+
+  if (UNMUTE_REQUEST_PATTERN.test(commandText)) {
+    if (targets.length > 1) {
+      if (!isController) return false;
+      await replyWithoutMentions(
+        message,
+        "Mention only one person to unmute, or say `unmute` to unmute yourself.",
+      );
+      return true;
+    }
+
+    if (targets.length === 1 && !isController) return false;
+
+    const target = targets[0] ?? message.author;
+    const targetKey = conversationKeyFor(
+      message.guildId!,
+      message.channelId,
+      target.id,
+    );
+    const mutedUntil = mutedConversations.get(targetKey);
+
+    if (!mutedUntil || mutedUntil <= Date.now()) {
+      mutedConversations.delete(targetKey);
+      await replyWithoutMentions(
+        message,
+        target.id === message.author.id
+          ? "You aren't muted right now."
+          : `${target.username} isn't muted right now in this channel.`,
+      );
+      return true;
+    }
+
+    mutedConversations.delete(targetKey);
+    const existingConversation = conversations.get(targetKey);
+    if (existingConversation) {
+      existingConversation.lastActivityAt = Date.now();
+    } else {
+      conversations.set(targetKey, {
+        messages: [],
+        lastActivityAt: Date.now(),
+      });
+    }
+
+    await replyWithoutMentions(
+      message,
+      target.id === message.author.id
+        ? "You're unmuted. Send your question here and I'll help."
+        : `${target.username} is unmuted in this channel.`,
+    );
+    return true;
+  }
+
+  if (!isController || !MUTE_REQUEST_PATTERN.test(commandText)) return false;
+
+  if (targets.length !== 1) {
+    await replyWithoutMentions(
+      message,
+      "Mention exactly one person to mute, then say `stop`, `stop talking`, or `talk in 19 minutes`.",
+    );
+    return true;
+  }
+
+  const target = targets[0]!;
+  if (target.bot) {
+    await replyWithoutMentions(message, "I can't mute a bot conversation.");
+    return true;
+  }
+
+  const mutedUntil = Date.now() + CONTROLLER_MUTE_DURATION_MS;
+  const targetKey = conversationKeyFor(
+    message.guildId!,
+    message.channelId,
+    target.id,
+  );
+  mutedConversations.set(targetKey, mutedUntil);
+  const targetConversation = conversations.get(targetKey);
+  if (targetConversation) targetConversation.lastActivityAt = mutedUntil;
+
+  await replyWithoutMentions(
+    message,
+    `I'll stop replying to ${target.username} in this channel for up to 19 minutes. They can ping me with \`unmute\` to resume sooner.`,
+  );
+  return true;
 }
 
 function isVouchCommand(content: string): boolean {
@@ -650,6 +777,8 @@ async function handleConversationMessage(
       { role: "system", content: SYSTEM_PROMPT },
       ...conversation.messages,
     ]);
+    const mutedUntil = mutedConversations.get(key);
+    if (mutedUntil && mutedUntil > Date.now()) return;
     conversation.messages.push({ role: "assistant", content: answer });
     conversation.messages = conversation.messages.slice(-MAX_HISTORY_MESSAGES);
     conversation.lastActivityAt = Date.now();
@@ -675,12 +804,17 @@ async function handleMessage(
 
   pruneExpiredState();
 
+  if (await handleMuteControlMessage(client, message)) return;
+
+  const key = conversationKey(message);
+  const mutedUntil = mutedConversations.get(key);
+  if (mutedUntil && mutedUntil > Date.now()) return;
+
   if (isVouchCommand(message.content)) {
     await handleVouchCommand(client, message);
     return;
   }
 
-  const key = conversationKey(message);
   if (ownerDiscordId && message.mentions.users.has(ownerDiscordId)) {
     conversations.set(key, { messages: [], lastActivityAt: Date.now() });
     await replyWithoutMentions(message, "What do you need? Send your question here and I’ll help.");
