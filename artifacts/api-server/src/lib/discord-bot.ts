@@ -6,17 +6,25 @@ import {
   Events,
   GatewayIntentBits,
   ApplicationCommandOptionType,
+  GuildExplicitContentFilter,
+  GuildVerificationLevel,
   PermissionFlagsBits,
   SlashCommandBuilder,
   type Guild,
   type ChatInputCommandInteraction,
   type Message,
+  type TextChannel,
 } from "discord.js";
 import { logger } from "./logger";
 import { getOpenRouterReply, type OpenRouterChatMessage } from "./openrouter";
 import { createVouchCard } from "./vouch-card";
 
 const DEFAULT_VOUCH_CHANNEL_ID = "1563987725168681111";
+const HONEY_POT_CHANNEL_NAME = "honey-pot";
+const HONEY_POT_WARNING =
+  "⚠️ **Honey Pot channel:** Posting here triggers an automatic kick. This channel helps identify suspected spam or compromised accounts. The server owner, admins, and members with the Mod, Moderator, or Owner role are exempt.";
+const HONEY_POT_CLEANUP_WINDOW_MS = 14 * 24 * 60 * 60 * 1000;
+const HONEY_POT_FETCH_LIMIT_PER_CHANNEL = 100;
 const SESSION_TTL_MS = 15 * 60 * 1000;
 const SESSION_CLEANUP_INTERVAL_MS = 5 * 60 * 1000;
 const AI_COOLDOWN_MS = 4_000;
@@ -45,6 +53,11 @@ const SERVER_SETUP_COMMAND = new SlashCommandBuilder()
     subcommand
       .setName("server")
       .setDescription("Create the channels shown in the CocoX.wtf server layout"),
+  )
+  .addSubcommand((subcommand) =>
+    subcommand
+      .setName("honeypot")
+      .setDescription("Set up a Honey Pot channel and stronger server protections"),
   )
   .toJSON();
 
@@ -149,6 +162,7 @@ const lastAiReplyAt = new Map<string, number>();
 const lastVouchAt = new Map<string, number>();
 const mutedGuilds = new Map<string, number>();
 const guildCommandRegistrations = new Map<string, Promise<void>>();
+const honeyPotKicksInProgress = new Set<string>();
 
 async function registerGuildCommands(guild: Guild): Promise<void> {
   const existingRegistration = guildCommandRegistrations.get(guild.id);
@@ -177,6 +191,11 @@ async function syncGuildCommands(guild: Guild): Promise<void> {
           type: ApplicationCommandOptionType.Subcommand,
           name: "server",
           description: "Create the channels shown in the CocoX.wtf server layout",
+        },
+        {
+          type: ApplicationCommandOptionType.Subcommand,
+          name: "honeypot",
+          description: "Set up a Honey Pot channel and stronger server protections",
         },
       ],
     });
@@ -462,6 +481,271 @@ async function handleServerSetup(
       `Server setup stopped. Created ${created.length} channel${created.length === 1 ? "" : "s"} before the error. Check the bot's Manage Channels permission and try again.`,
     );
   }
+}
+
+async function handleHoneyPotSetup(
+  interaction: ChatInputCommandInteraction,
+): Promise<void> {
+  const guild = interaction.guild;
+  if (!guild) {
+    await interaction.reply({
+      content: "This command can only be used in a server.",
+      ephemeral: true,
+    });
+    return;
+  }
+
+  if (!interaction.memberPermissions?.has(PermissionFlagsBits.Administrator)) {
+    await interaction.reply({
+      content: "Only server administrators can run `/setup honeypot`.",
+      ephemeral: true,
+    });
+    return;
+  }
+
+  const requiredPermissions: [string, bigint][] = [
+    ["Manage Channels", PermissionFlagsBits.ManageChannels],
+    ["Manage Messages", PermissionFlagsBits.ManageMessages],
+    ["Kick Members", PermissionFlagsBits.KickMembers],
+    ["Manage Server", PermissionFlagsBits.ManageGuild],
+    ["Send Messages", PermissionFlagsBits.SendMessages],
+    ["Read Message History", PermissionFlagsBits.ReadMessageHistory],
+  ];
+  const missingPermissions = requiredPermissions
+    .filter(([, permission]) => !interaction.appPermissions.has(permission))
+    .map(([name]) => name);
+  if (missingPermissions.length > 0) {
+    await interaction.reply({
+      content: `I need these bot permissions first: ${missingPermissions.join(", ")}.`,
+      ephemeral: true,
+    });
+    return;
+  }
+
+  await interaction.reply({
+    content: "Setting up the Honey Pot and raid protections…",
+    ephemeral: true,
+  });
+
+  try {
+    await guild.channels.fetch();
+    const existingChannel = guild.channels.cache.find(
+      (channel): channel is TextChannel =>
+        channel.name === HONEY_POT_CHANNEL_NAME &&
+        channel.type === ChannelType.GuildText,
+    );
+    const textCategory = guild.channels.cache.find(
+      (channel) =>
+        channel.name === "Text Channels" &&
+        channel.type === ChannelType.GuildCategory,
+    );
+    const honeyPotChannel =
+      existingChannel ??
+      (await guild.channels.create({
+        name: HONEY_POT_CHANNEL_NAME,
+        type: ChannelType.GuildText,
+        topic:
+          "Posting here triggers an automatic kick for non-staff members.",
+        ...(textCategory ? { parent: textCategory.id } : {}),
+      }));
+
+    const botId = interaction.client.user?.id;
+    if (!botId) throw new Error("Discord bot user is unavailable.");
+
+    const recentChannelMessages = await honeyPotChannel.messages.fetch({
+      limit: 50,
+    });
+    const existingWarning = recentChannelMessages.find(
+      (message) =>
+        message.author.id === botId &&
+        message.content === HONEY_POT_WARNING,
+    );
+    const warningMessage =
+      existingWarning ??
+      (await honeyPotChannel.send({
+        content: HONEY_POT_WARNING,
+        allowedMentions: { parse: [] },
+      }));
+    if (!warningMessage.pinned) await warningMessage.pin();
+
+    await guild.setVerificationLevel(
+      GuildVerificationLevel.VeryHigh,
+      "CocoX.wtf Honey Pot raid protection setup",
+    );
+    await guild.setExplicitContentFilter(
+      GuildExplicitContentFilter.AllMembers,
+      "CocoX.wtf Honey Pot raid protection setup",
+    );
+
+    await interaction.editReply(
+      `Honey Pot is ready in <#${honeyPotChannel.id}>. I pinned the warning, will kick non-staff who post there, and will try to delete their recent messages across the server. Verification is set to Very High and the content filter to All Members. This adds protection but cannot make a server unraidable.`,
+    );
+  } catch (error) {
+    logger.warn(
+      {
+        guildId: guild.id,
+        error: error instanceof Error ? error.message : "Unknown error",
+      },
+      "Honey Pot setup failed",
+    );
+    await interaction.editReply(
+      "Honey Pot setup failed or only partially completed. Check the bot's Manage Channels, Manage Messages, Kick Members, Manage Server, Send Messages, and Read Message History permissions.",
+    );
+  }
+}
+
+function isHoneyPotStaff(
+  member: NonNullable<Message["member"]>,
+  guild: Guild,
+): boolean {
+  if (
+    member.id === guild.ownerId ||
+    member.permissions.has(PermissionFlagsBits.Administrator)
+  ) {
+    return true;
+  }
+
+  const exemptRoleNames = new Set(["mod", "moderator", "owner", "admin"]);
+  return member.roles.cache.some((role) =>
+    exemptRoleNames.has(role.name.trim().toLocaleLowerCase()),
+  );
+}
+
+async function deleteRecentMessagesFromUser(
+  guild: Guild,
+  userId: string,
+): Promise<{ deleted: number; failedChannels: number }> {
+  const cutoff = Date.now() - HONEY_POT_CLEANUP_WINDOW_MS;
+  let deleted = 0;
+  let failedChannels = 0;
+
+  try {
+    await guild.channels.fetch();
+  } catch {
+    return { deleted, failedChannels: 1 };
+  }
+
+  for (const channel of guild.channels.cache.values()) {
+    if (
+      channel.type !== ChannelType.GuildText &&
+      channel.type !== ChannelType.GuildAnnouncement
+    ) {
+      continue;
+    }
+
+    try {
+      const recentMessages = await channel.messages.fetch({
+        limit: HONEY_POT_FETCH_LIMIT_PER_CHANNEL,
+      });
+      const authoredRecentMessages = recentMessages.filter(
+        (message) =>
+          message.author.id === userId &&
+          message.createdTimestamp >= cutoff,
+      );
+      if (authoredRecentMessages.size === 0) continue;
+
+      const deletedMessages = await channel.bulkDelete(
+        authoredRecentMessages,
+        true,
+      );
+      deleted += deletedMessages.size;
+    } catch (error) {
+      failedChannels += 1;
+      logger.debug(
+        {
+          guildId: guild.id,
+          channelId: channel.id,
+          error: error instanceof Error ? error.message : "Unknown error",
+        },
+        "Could not delete recent Honey Pot offender messages from channel",
+      );
+    }
+  }
+
+  return { deleted, failedChannels };
+}
+
+async function handleHoneyPotMessage(message: Message): Promise<boolean> {
+  if (!message.guildId) return false;
+
+  const guild = message.guild;
+  if (!guild) return false;
+
+  const channel = message.channel;
+  const directChannelName = "name" in channel ? channel.name : undefined;
+  const parentId = "parentId" in channel ? channel.parentId : null;
+  const parentChannelName = parentId
+    ? guild.channels.cache.get(parentId)?.name
+    : undefined;
+  const isHoneyPotTextChannel =
+    channel.type === ChannelType.GuildText &&
+    directChannelName === HONEY_POT_CHANNEL_NAME;
+  const isHoneyPotThread =
+    (channel.type === ChannelType.PublicThread ||
+      channel.type === ChannelType.PrivateThread ||
+      channel.type === ChannelType.AnnouncementThread) &&
+    parentChannelName === HONEY_POT_CHANNEL_NAME;
+  if (!isHoneyPotTextChannel && !isHoneyPotThread) return false;
+
+  let member = message.member;
+  if (!member) {
+    try {
+      member = await guild.members.fetch(message.author.id);
+    } catch (error) {
+      logger.warn(
+        {
+          guildId: message.guildId,
+          userId: message.author.id,
+          error: error instanceof Error ? error.message : "Unknown error",
+        },
+        "Could not check Honey Pot poster roles; skipped kick",
+      );
+      return true;
+    }
+  }
+
+  if (isHoneyPotStaff(member, guild)) return true;
+
+  const processingKey = `${message.guildId}:${message.author.id}`;
+  if (honeyPotKicksInProgress.has(processingKey)) {
+    await message.delete().catch(() => undefined);
+    return true;
+  }
+
+  honeyPotKicksInProgress.add(processingKey);
+  try {
+    await message.delete().catch(() => undefined);
+    await guild.members.kick(
+      message.author.id,
+      "Posted in the CocoX.wtf Honey Pot channel",
+    );
+    const cleanup = await deleteRecentMessagesFromUser(
+      guild,
+      message.author.id,
+    );
+    logger.info(
+      {
+        guildId: message.guildId,
+        userId: message.author.id,
+        deletedMessages: cleanup.deleted,
+        channelsWithCleanupErrors: cleanup.failedChannels,
+      },
+      "Kicked non-staff Honey Pot poster and cleaned up recent messages",
+    );
+  } catch (error) {
+    logger.warn(
+      {
+        guildId: message.guildId,
+        userId: message.author.id,
+        error: error instanceof Error ? error.message : "Unknown error",
+      },
+      "Could not kick Honey Pot poster",
+    );
+  } finally {
+    honeyPotKicksInProgress.delete(processingKey);
+  }
+
+  return true;
 }
 
 function conversationKeyFor(
@@ -832,7 +1116,9 @@ async function handleMessage(
   message: Message,
   ownerDiscordId: string | undefined,
 ): Promise<void> {
-  if (message.author.bot || !message.guildId) return;
+  if (message.author.bot) return;
+  if (await handleHoneyPotMessage(message)) return;
+  if (!message.guildId) return;
 
   pruneExpiredState();
 
@@ -927,6 +1213,11 @@ export async function startDiscordBot(): Promise<void> {
       interaction.options.getSubcommand() === "server"
     ) {
       handler = () => handleServerSetup(interaction);
+    } else if (
+      interaction.commandName === "setup" &&
+      interaction.options.getSubcommand() === "honeypot"
+    ) {
+      handler = () => handleHoneyPotSetup(interaction);
     } else if (
       interaction.commandName === "create" &&
       interaction.options.getSubcommand() === "roles"
