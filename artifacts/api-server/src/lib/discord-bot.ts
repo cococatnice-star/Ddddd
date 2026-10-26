@@ -6,6 +6,7 @@ import {
   Events,
   GatewayIntentBits,
   ApplicationCommandOptionType,
+  AuditLogEvent,
   GuildExplicitContentFilter,
   GuildVerificationLevel,
   PermissionFlagsBits,
@@ -25,6 +26,29 @@ const HONEY_POT_WARNING =
   "⚠️ **Honey Pot channel:** Posting here triggers an automatic kick. This channel helps identify suspected spam or compromised accounts. The server owner, admins, and members with the Mod, Moderator, or Owner role are exempt.";
 const HONEY_POT_CLEANUP_WINDOW_MS = 14 * 24 * 60 * 60 * 1000;
 const HONEY_POT_FETCH_LIMIT_PER_CHANNEL = 100;
+const PROTECTIVE_BOT_NAME_PATTERN =
+  /\b(?:anti|guard|protect(?:ion)?|security|moderation|defen[cs]e|safety|helper)\b/;
+const SUSPICIOUS_BOT_NAME_RULES = [
+  { label: "raid-related name", pattern: /\braid(?:\s*bot|\s*spammer)?\b/ },
+  {
+    label: "nuke-related name",
+    pattern: /\b(?:nuker?|server\s*nuke)(?:\s*bot)?\b/,
+  },
+  {
+    label: "mass-ban/kick/delete name",
+    pattern: /\bmass\s*(?:ban|kick|delete)(?:\s*bot)?\b/,
+  },
+  {
+    label: "token-stealing name",
+    pattern: /\btoken\s*(?:grabber|stealer)(?:\s*bot)?\b/,
+  },
+  {
+    label: "server-destruction name",
+    pattern: /\b(?:server\s*)?destroy(?:er)?(?:\s*bot)?\b/,
+  },
+  { label: "crasher name", pattern: /\bcrasher(?:\s*bot)?\b/ },
+  { label: "spammer name", pattern: /\b(?:spam\s*bot|spammer)(?:\s*bot)?\b/ },
+] as const;
 const SESSION_TTL_MS = 15 * 60 * 1000;
 const SESSION_CLEANUP_INTERVAL_MS = 5 * 60 * 1000;
 const AI_COOLDOWN_MS = 4_000;
@@ -1145,6 +1169,145 @@ async function handleMessage(
   await handleConversationMessage(message, key, conversation);
 }
 
+function normalizeBotName(name: string): string {
+  return name
+    .normalize("NFKD")
+    .replace(/\p{M}/gu, "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, " ")
+    .trim();
+}
+
+function findSuspiciousBotNameRule(
+  names: string[],
+): (typeof SUSPICIOUS_BOT_NAME_RULES)[number] | undefined {
+  for (const name of names) {
+    const normalizedName = normalizeBotName(name);
+    if (!normalizedName || PROTECTIVE_BOT_NAME_PATTERN.test(normalizedName)) {
+      continue;
+    }
+
+    const rule = SUSPICIOUS_BOT_NAME_RULES.find(({ pattern }) =>
+      pattern.test(normalizedName),
+    );
+    if (rule) return rule;
+  }
+
+  return undefined;
+}
+
+async function notifyBotSecurityRecipients(
+  client: Client,
+  guild: Guild,
+  ownerDiscordId: string | undefined,
+  content: string,
+): Promise<void> {
+  const recipientIds = new Set(
+    [guild.ownerId, ownerDiscordId].filter(
+      (id): id is string => Boolean(id && /^\d{17,20}$/.test(id)),
+    ),
+  );
+
+  for (const recipientId of recipientIds) {
+    try {
+      const recipient = await client.users.fetch(recipientId);
+      await recipient.send({
+        content,
+        allowedMentions: { parse: [] },
+      });
+    } catch (error) {
+      logger.warn(
+        {
+          guildId: guild.id,
+          recipientId,
+          error: error instanceof Error ? error.message : "Unknown error",
+        },
+        "Could not DM a bot security alert recipient",
+      );
+    }
+  }
+}
+
+async function handleBotAddAuditEntry(
+  client: Client,
+  guild: Guild,
+  botUserId: string,
+  addedById: string | null,
+  ownerDiscordId: string | undefined,
+): Promise<void> {
+  let botUser;
+  try {
+    botUser = await client.users.fetch(botUserId);
+  } catch (error) {
+    logger.warn(
+      {
+        guildId: guild.id,
+        botUserId,
+        error: error instanceof Error ? error.message : "Unknown error",
+      },
+      "Could not fetch a newly added bot account",
+    );
+  }
+
+  if (botUser && !botUser.bot) return;
+
+  const matchedRule = botUser
+    ? findSuspiciousBotNameRule([botUser.username, botUser.globalName ?? ""])
+    : undefined;
+  let kicked = false;
+  let kickError: string | undefined;
+
+  if (matchedRule) {
+    try {
+      await guild.members.kick(
+        botUserId,
+        `New bot name matched suspicious pattern: ${matchedRule.label}`,
+      );
+      kicked = true;
+    } catch (error) {
+      kickError =
+        error instanceof Error ? error.message : "Unknown kick error";
+      logger.warn(
+        {
+          guildId: guild.id,
+          botUserId,
+          matchedRule: matchedRule.label,
+          error: kickError,
+        },
+        "Could not kick a bot with a suspicious name",
+      );
+    }
+  }
+
+  const botName = botUser?.username ?? "unknown name";
+  const result = !botUser
+    ? "I could not read its username, so I did not auto-kick it."
+    : matchedRule
+      ? kicked
+        ? `Its name matched the ${matchedRule.label} rule, so I kicked it.`
+        : `Its name matched the ${matchedRule.label} rule, but the kick failed. Check my Kick Members permission and role position.`
+      : "No high-confidence suspicious-name rule matched, so I left it in the server for review.";
+  const alert = [
+    `CocoX.wtf security alert: bot ${botName} (ID ${botUserId}) was added to ${guild.name}.`,
+    `Added by user ID: ${addedById ?? "unknown"}.`,
+    result,
+    "Name matching is a heuristic; it cannot confirm whether an account is malicious.",
+  ].join("\n");
+
+  await notifyBotSecurityRecipients(client, guild, ownerDiscordId, alert);
+  logger.info(
+    {
+      guildId: guild.id,
+      botUserId,
+      addedById,
+      matchedRule: matchedRule?.label,
+      kicked,
+      kickError,
+    },
+    "Processed a bot-add audit entry",
+  );
+}
+
 export async function startDiscordBot(): Promise<void> {
   const token = process.env.DISCORD_BOT_TOKEN?.trim();
   if (!token) {
@@ -1169,6 +1332,7 @@ export async function startDiscordBot(): Promise<void> {
   const client = new Client({
     intents: [
       GatewayIntentBits.Guilds,
+      GatewayIntentBits.GuildModeration,
       GatewayIntentBits.GuildMessages,
       GatewayIntentBits.MessageContent,
     ],
@@ -1200,6 +1364,27 @@ export async function startDiscordBot(): Promise<void> {
           error: error instanceof Error ? error.message : "Unknown error",
         },
         "Could not register CocoX.wtf slash commands",
+      );
+    });
+  });
+
+  client.on(Events.GuildAuditLogEntryCreate, (entry, guild) => {
+    if (entry.action !== AuditLogEvent.BotAdd || !entry.targetId) return;
+
+    void handleBotAddAuditEntry(
+      client,
+      guild,
+      entry.targetId,
+      entry.executorId,
+      ownerDiscordId,
+    ).catch((error: unknown) => {
+      logger.warn(
+        {
+          guildId: guild.id,
+          botUserId: entry.targetId,
+          error: error instanceof Error ? error.message : "Unknown error",
+        },
+        "Could not process a bot-add security event",
       );
     });
   });
