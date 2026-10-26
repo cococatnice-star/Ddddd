@@ -10,7 +10,7 @@ This bot starts when the API Server workflow starts. It does not post on a timer
 - A person can submit their own public feedback with `!vouch <your own feedback>`. The bot creates a CocoX.wtf-branded image showing the submitter’s Discord username and posts it to the configured vouch channel. It does not invent names or endorsements.
 - Server administrators can run `/setup server` to create the channel groups and channels shown in the CocoX.wtf layout. The command skips channels already in the right place and does not change existing channel permissions.
 - Server administrators can run `/create roles` to create community roles. The `Moderator` role gets timeout, voice mute/deafen, message management, and kick permissions when newly created; existing role names are skipped and left unchanged. Other new roles have no extra permissions, and roles are not automatically assigned to members.
-- Two approved Discord accounts can ping the bot, mention one person, and say `stop`, `stop talking`, or `talk in 19 minutes` to silence bot replies to that person in that channel for up to 19 minutes. The person can ping the bot and say `unmute` sooner; ordinary Discord messages are unaffected.
+- Two approved Discord accounts can ping the bot and say `stop`, `stop talking`, or `talk in 19 minutes` to silence bot replies to everyone in that server, across all channels, for up to 19 minutes. An approved account can ping the bot and say `unmute` to resume sooner.
 - Conversations expire after 15 minutes without a message. `!stop` ends one early.
 
 ## Connect the bot

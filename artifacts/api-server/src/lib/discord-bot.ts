@@ -146,7 +146,7 @@ type Conversation = {
 const conversations = new Map<string, Conversation>();
 const lastAiReplyAt = new Map<string, number>();
 const lastVouchAt = new Map<string, number>();
-const mutedConversations = new Map<string, number>();
+const mutedGuilds = new Map<string, number>();
 const guildCommandRegistrations = new Map<string, Promise<void>>();
 
 async function registerGuildCommands(guild: Guild): Promise<void> {
@@ -500,8 +500,8 @@ function pruneExpiredState(now = Date.now()): void {
     if (now - timestamp > VOUCH_COOLDOWN_MS * 2) lastVouchAt.delete(key);
   }
 
-  for (const [key, mutedUntil] of mutedConversations) {
-    if (now >= mutedUntil) mutedConversations.delete(key);
+  for (const [guildId, mutedUntil] of mutedGuilds) {
+    if (now >= mutedUntil) mutedGuilds.delete(guildId);
   }
 }
 
@@ -525,90 +525,42 @@ async function handleMuteControlMessage(
 
   const commandText = stripUserMentions(message.content);
   const isController = BOT_MUTE_CONTROLLER_IDS.has(message.author.id);
-  const targets = [...message.mentions.users.values()].filter(
-    (user) => user.id !== botId,
-  );
+  if (!isController) return false;
 
   if (UNMUTE_REQUEST_PATTERN.test(commandText)) {
-    if (targets.length > 1) {
-      if (!isController) return false;
-      await replyWithoutMentions(
-        message,
-        "Mention only one person to unmute, or say `unmute` to unmute yourself.",
-      );
-      return true;
-    }
-
-    if (targets.length === 1 && !isController) return false;
-
-    const target = targets[0] ?? message.author;
-    const targetKey = conversationKeyFor(
-      message.guildId!,
-      message.channelId,
-      target.id,
-    );
-    const mutedUntil = mutedConversations.get(targetKey);
+    const mutedUntil = mutedGuilds.get(message.guildId!);
 
     if (!mutedUntil || mutedUntil <= Date.now()) {
-      mutedConversations.delete(targetKey);
+      mutedGuilds.delete(message.guildId!);
       await replyWithoutMentions(
         message,
-        target.id === message.author.id
-          ? "You aren't muted right now."
-          : `${target.username} isn't muted right now in this channel.`,
+        "Bot replies aren't muted for this server right now.",
       );
       return true;
     }
 
-    mutedConversations.delete(targetKey);
-    const existingConversation = conversations.get(targetKey);
-    if (existingConversation) {
-      existingConversation.lastActivityAt = Date.now();
-    } else {
-      conversations.set(targetKey, {
-        messages: [],
-        lastActivityAt: Date.now(),
-      });
-    }
-
+    mutedGuilds.delete(message.guildId!);
     await replyWithoutMentions(
       message,
-      target.id === message.author.id
-        ? "You're unmuted. Send your question here and I'll help."
-        : `${target.username} is unmuted in this channel.`,
+      "Bot replies are back for everyone in this server.",
     );
     return true;
   }
 
-  if (!isController || !MUTE_REQUEST_PATTERN.test(commandText)) return false;
-
-  if (targets.length !== 1) {
-    await replyWithoutMentions(
-      message,
-      "Mention exactly one person to mute, then say `stop`, `stop talking`, or `talk in 19 minutes`.",
-    );
-    return true;
-  }
-
-  const target = targets[0]!;
-  if (target.bot) {
-    await replyWithoutMentions(message, "I can't mute a bot conversation.");
-    return true;
-  }
+  if (!MUTE_REQUEST_PATTERN.test(commandText)) return false;
 
   const mutedUntil = Date.now() + CONTROLLER_MUTE_DURATION_MS;
-  const targetKey = conversationKeyFor(
-    message.guildId!,
-    message.channelId,
-    target.id,
-  );
-  mutedConversations.set(targetKey, mutedUntil);
-  const targetConversation = conversations.get(targetKey);
-  if (targetConversation) targetConversation.lastActivityAt = mutedUntil;
+  mutedGuilds.set(message.guildId!, mutedUntil);
+  const guildConversationPrefix = `${message.guildId}:`;
+  for (const [key, conversation] of conversations) {
+    if (key.startsWith(guildConversationPrefix)) {
+      conversation.lastActivityAt = mutedUntil;
+    }
+  }
 
   await replyWithoutMentions(
     message,
-    `I'll stop replying to ${target.username} in this channel for up to 19 minutes. They can ping me with \`unmute\` to resume sooner.`,
+    "I'll stop replying to everyone in this server, across all channels, for up to 19 minutes. An approved account can ping me and say `unmute` to resume sooner.",
   );
   return true;
 }
@@ -777,7 +729,9 @@ async function handleConversationMessage(
       { role: "system", content: SYSTEM_PROMPT },
       ...conversation.messages,
     ]);
-    const mutedUntil = mutedConversations.get(key);
+    const mutedUntil = message.guildId
+      ? mutedGuilds.get(message.guildId)
+      : undefined;
     if (mutedUntil && mutedUntil > Date.now()) return;
     conversation.messages.push({ role: "assistant", content: answer });
     conversation.messages = conversation.messages.slice(-MAX_HISTORY_MESSAGES);
@@ -806,9 +760,10 @@ async function handleMessage(
 
   if (await handleMuteControlMessage(client, message)) return;
 
+  const guildMutedUntil = mutedGuilds.get(message.guildId);
+  if (guildMutedUntil && guildMutedUntil > Date.now()) return;
+
   const key = conversationKey(message);
-  const mutedUntil = mutedConversations.get(key);
-  if (mutedUntil && mutedUntil > Date.now()) return;
 
   if (isVouchCommand(message.content)) {
     await handleVouchCommand(client, message);
