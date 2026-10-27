@@ -10,6 +10,7 @@ import {
   GuildExplicitContentFilter,
   GuildVerificationLevel,
   PermissionFlagsBits,
+  Partials,
   SlashCommandBuilder,
   type Guild,
   type ChatInputCommandInteraction,
@@ -26,6 +27,7 @@ const HONEY_POT_WARNING =
   "⚠️ **Honey Pot channel:** Posting here triggers an automatic kick. This channel helps identify suspected spam or compromised accounts. The server owner, admins, and members with the Mod, Moderator, or Owner role are exempt.";
 const HONEY_POT_CLEANUP_WINDOW_MS = 14 * 24 * 60 * 60 * 1000;
 const HONEY_POT_FETCH_LIMIT_PER_CHANNEL = 100;
+const BOT_KICK_APPROVAL_TTL_MS = 24 * 60 * 60 * 1000;
 const PROTECTIVE_BOT_NAME_PATTERN =
   /\b(?:anti|guard|protect(?:ion)?|security|moderation|defen[cs]e|safety|helper)\b/;
 const SUSPICIOUS_BOT_NAME_RULES = [
@@ -181,12 +183,26 @@ type Conversation = {
   lastActivityAt: number;
 };
 
+type PendingBotKickRequest = {
+  guildId: string;
+  botUserId: string;
+  botName: string;
+  recipientId: string;
+  expiresAt: number;
+};
+
+type PendingBotKickResolution = {
+  request?: PendingBotKickRequest;
+  ambiguous: boolean;
+};
+
 const conversations = new Map<string, Conversation>();
 const lastAiReplyAt = new Map<string, number>();
 const lastVouchAt = new Map<string, number>();
 const mutedGuilds = new Map<string, number>();
 const guildCommandRegistrations = new Map<string, Promise<void>>();
 const honeyPotKicksInProgress = new Set<string>();
+const pendingBotKickRequests = new Map<string, PendingBotKickRequest>();
 
 async function registerGuildCommands(guild: Guild): Promise<void> {
   const existingRegistration = guildCommandRegistrations.get(guild.id);
@@ -1201,9 +1217,10 @@ async function notifyBotSecurityRecipients(
   guild: Guild,
   ownerDiscordId: string | undefined,
   content: string,
+  pendingKick?: Omit<PendingBotKickRequest, "recipientId" | "expiresAt">,
 ): Promise<void> {
   const recipientIds = new Set(
-    [guild.ownerId, ownerDiscordId].filter(
+    [guild.ownerId, ownerDiscordId, ...BOT_MUTE_CONTROLLER_IDS].filter(
       (id): id is string => Boolean(id && /^\d{17,20}$/.test(id)),
     ),
   );
@@ -1211,10 +1228,17 @@ async function notifyBotSecurityRecipients(
   for (const recipientId of recipientIds) {
     try {
       const recipient = await client.users.fetch(recipientId);
-      await recipient.send({
+      const alertMessage = await recipient.send({
         content,
         allowedMentions: { parse: [] },
       });
+      if (pendingKick) {
+        pendingBotKickRequests.set(alertMessage.id, {
+          ...pendingKick,
+          recipientId,
+          expiresAt: Date.now() + BOT_KICK_APPROVAL_TTL_MS,
+        });
+      }
     } catch (error) {
       logger.warn(
         {
@@ -1226,6 +1250,214 @@ async function notifyBotSecurityRecipients(
       );
     }
   }
+}
+
+function parseBotSecurityAlertMessage(
+  client: Client,
+  alertMessage: Message,
+  recipientId: string,
+): PendingBotKickRequest | undefined {
+  if (
+    alertMessage.author.id !== client.user?.id ||
+    Date.now() - alertMessage.createdTimestamp > BOT_KICK_APPROVAL_TTL_MS ||
+    alertMessage.content.includes("so I kicked it.")
+  ) {
+    return undefined;
+  }
+
+  const firstLine = alertMessage.content.split(/\r?\n/, 1)[0] ?? "";
+  const match = firstLine.match(
+    /^CocoX\.wtf security alert: bot (.+) \(ID (\d{17,20})\) was added to (.+)\.$/,
+  );
+  if (!match) return undefined;
+
+  const botName = match[1]!;
+  const botUserId = match[2]!;
+  const alertGuildName = match[3]!;
+  const guildIdFromAlert = alertMessage.content.match(
+    /^Server ID: (\d{17,20})\.?$/m,
+  )?.[1];
+
+  let guildId = guildIdFromAlert;
+  if (!guildId || !client.guilds.cache.has(guildId)) {
+    const matchingGuilds = client.guilds.cache.filter(
+      (guild) => guild.name === alertGuildName,
+    );
+    if (matchingGuilds.size !== 1) return undefined;
+    guildId = matchingGuilds.first()!.id;
+  }
+
+  return {
+    guildId,
+    botUserId,
+    botName,
+    recipientId,
+    expiresAt: alertMessage.createdTimestamp + BOT_KICK_APPROVAL_TTL_MS,
+  };
+}
+
+async function resolvePendingBotKickRequest(
+  client: Client,
+  message: Message,
+): Promise<PendingBotKickResolution> {
+  const now = Date.now();
+  for (const [alertMessageId, request] of pendingBotKickRequests) {
+    if (request.expiresAt <= now) {
+      pendingBotKickRequests.delete(alertMessageId);
+    }
+  }
+
+  const referencedMessageId = message.reference?.messageId;
+  if (referencedMessageId) {
+    const pendingRequest = pendingBotKickRequests.get(referencedMessageId);
+    if (pendingRequest?.recipientId === message.author.id) {
+      return { request: pendingRequest, ambiguous: false };
+    }
+
+    if (message.channel.isTextBased()) {
+      const referencedMessage = await message.channel.messages
+        .fetch(referencedMessageId)
+        .catch(() => null);
+      if (referencedMessage) {
+        const request = parseBotSecurityAlertMessage(
+          client,
+          referencedMessage,
+          message.author.id,
+        );
+        if (request) return { request, ambiguous: false };
+      }
+    }
+  }
+
+  const inMemoryRequests = [...pendingBotKickRequests.values()].filter(
+    (request) =>
+      request.recipientId === message.author.id && request.expiresAt > now,
+  );
+  if (inMemoryRequests.length === 1) {
+    return { request: inMemoryRequests[0], ambiguous: false };
+  }
+  if (inMemoryRequests.length > 1) return { ambiguous: true };
+
+  if (!message.channel.isTextBased()) return { ambiguous: false };
+  const recentMessages = await message.channel.messages
+    .fetch({ limit: 50 })
+    .catch(() => null);
+  if (!recentMessages) return { ambiguous: false };
+
+  const historyRequests = new Map<string, PendingBotKickRequest>();
+  for (const alertMessage of recentMessages.values()) {
+    const request = parseBotSecurityAlertMessage(
+      client,
+      alertMessage,
+      message.author.id,
+    );
+    if (request) {
+      historyRequests.set(`${request.guildId}:${request.botUserId}`, request);
+    }
+  }
+
+  if (historyRequests.size === 1) {
+    return {
+      request: historyRequests.values().next().value,
+      ambiguous: false,
+    };
+  }
+  return { ambiguous: historyRequests.size > 1 };
+}
+
+async function handleBotKickApprovalMessage(
+  client: Client,
+  message: Message,
+  ownerDiscordId: string | undefined,
+): Promise<boolean> {
+  if (
+    message.guildId ||
+    !/^(?:kick|kick bot)$/i.test(message.content.trim())
+  ) {
+    return false;
+  }
+
+  const resolution = await resolvePendingBotKickRequest(client, message);
+  if (resolution.ambiguous) {
+    await message.reply(
+      'More than one bot alert is waiting. Reply directly to the specific alert with `kick`.',
+    );
+    return true;
+  }
+  const request = resolution.request;
+  if (!request) {
+    await message.reply(
+      'I could not match that to a recent bot alert. Reply directly to the alert with `kick`.',
+    );
+    return true;
+  }
+
+  const guild = client.guilds.cache.get(request.guildId);
+  if (!guild) {
+    await message.reply(
+      "I can't access that server anymore, so I couldn't kick the bot.",
+    );
+    return true;
+  }
+  if (
+    message.author.id !== guild.ownerId &&
+    message.author.id !== ownerDiscordId &&
+    !BOT_MUTE_CONTROLLER_IDS.has(message.author.id)
+  ) {
+    await message.reply(
+      "Only the server owner and approved security controllers can approve this kick.",
+    );
+    return true;
+  }
+
+  let targetUser;
+  try {
+    targetUser = await client.users.fetch(request.botUserId);
+  } catch {
+    await message.reply(
+      "I couldn't verify that bot account, so I didn't kick anything.",
+    );
+    return true;
+  }
+  if (!targetUser.bot) {
+    await message.reply(
+      "That account is not a bot, so I won't kick it with this approval.",
+    );
+    return true;
+  }
+
+  try {
+    await guild.members.kick(
+      request.botUserId,
+      `Kick approved by ${message.author.id} from a CocoX.wtf security alert`,
+    );
+    for (const [alertMessageId, pendingRequest] of pendingBotKickRequests) {
+      if (
+        pendingRequest.guildId === request.guildId &&
+        pendingRequest.botUserId === request.botUserId
+      ) {
+        pendingBotKickRequests.delete(alertMessageId);
+      }
+    }
+    await message.reply(
+      `Removed ${request.botName} from ${guild.name}.`,
+    );
+  } catch (error) {
+    logger.warn(
+      {
+        guildId: guild.id,
+        botUserId: request.botUserId,
+        approverId: message.author.id,
+        error: error instanceof Error ? error.message : "Unknown error",
+      },
+      "Could not complete an approved bot kick",
+    );
+    await message.reply(
+      "I couldn't kick that bot. It may have already left, or I may need Kick Members permission and a higher role.",
+    );
+  }
+
+  return true;
 }
 
 async function handleBotAddAuditEntry(
@@ -1289,12 +1521,31 @@ async function handleBotAddAuditEntry(
       : "No high-confidence suspicious-name rule matched, so I left it in the server for review.";
   const alert = [
     `CocoX.wtf security alert: bot ${botName} (ID ${botUserId}) was added to ${guild.name}.`,
+    `Server ID: ${guild.id}.`,
     `Added by user ID: ${addedById ?? "unknown"}.`,
     result,
     "Name matching is a heuristic; it cannot confirm whether an account is malicious.",
-  ].join("\n");
+  ];
+  const pendingKick = kicked
+    ? undefined
+    : {
+        guildId: guild.id,
+        botUserId,
+        botName,
+      };
+  if (pendingKick) {
+    alert.push(
+      'Reply to this DM with `kick` to remove this bot. Only the server owner and approved security controllers can approve it.',
+    );
+  }
 
-  await notifyBotSecurityRecipients(client, guild, ownerDiscordId, alert);
+  await notifyBotSecurityRecipients(
+    client,
+    guild,
+    ownerDiscordId,
+    alert.join("\n"),
+    pendingKick,
+  );
   logger.info(
     {
       guildId: guild.id,
